@@ -9,9 +9,7 @@ import logging
 import os
 import queue
 import threading
-import time
 import traceback
-import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
@@ -34,8 +32,6 @@ class ApiError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class DetectorKey:
-    running_mode: str
-    stream_id: str
     delegate: str | None
     display_names_locale: str | None
     max_results: int
@@ -55,9 +51,8 @@ def _parse_string_list(value: Any, field_name: str) -> tuple[str, ...]:
 
 
 def _coerce_detector_key(config: dict[str, Any]) -> DetectorKey:
-    mode = str(config.get("running_mode", "IMAGE")).upper()
-    if mode not in {"IMAGE", "VIDEO", "LIVE_STREAM"}:
-        raise ApiError(400, "running_mode must be IMAGE, VIDEO, or LIVE_STREAM")
+    if "running_mode" in config:
+        raise ApiError(400, "running_mode is no longer supported")
 
     opts = dict(config.get("object_detector_options") or config.get("detector_options") or {})
 
@@ -91,15 +86,11 @@ def _coerce_detector_key(config: dict[str, Any]) -> DetectorKey:
     if allowlist and denylist:
         raise ApiError(400, "category_allowlist and category_denylist are mutually exclusive")
 
-    stream_id = str(config.get("stream_id", "default" if mode != "IMAGE" else "image"))
-
     display_names_locale = opts.get("display_names_locale")
     if display_names_locale is not None:
         display_names_locale = str(display_names_locale)
 
     return DetectorKey(
-        running_mode=mode,
-        stream_id=stream_id,
         delegate=delegate,
         display_names_locale=display_names_locale,
         max_results=max_results,
@@ -107,16 +98,6 @@ def _coerce_detector_key(config: dict[str, Any]) -> DetectorKey:
         category_allowlist=allowlist,
         category_denylist=denylist,
     )
-
-
-def _coerce_timestamp_ms(config: dict[str, Any], mode: str) -> int | None:
-    if mode == "IMAGE":
-        return None
-    if "timestamp_ms" not in config or config.get("timestamp_ms") is None:
-        if mode == "LIVE_STREAM":
-            return time.monotonic_ns() // 1_000_000
-        raise ApiError(400, "timestamp_ms is required when running_mode is VIDEO")
-    return int(config["timestamp_ms"])
 
 
 def _make_image_processing_options(config: dict[str, Any]) -> Any | None:
@@ -207,10 +188,6 @@ class MediaPipeWorker:
         self._thread = threading.Thread(target=self._run, name="mediapipe-worker", daemon=True)
         self._closed = False
         self._detectors: dict[DetectorKey, Any] = {}
-        self._live_lock = threading.Lock()
-        self._live_pending: dict[tuple[DetectorKey, int], concurrent.futures.Future] = {}
-        self._live_job_by_key_ts: dict[tuple[DetectorKey, int], str] = {}
-        self._live_jobs: dict[str, dict[str, Any]] = {}
         self._thread.start()
 
     def submit(self, func: Callable[[], Any]) -> concurrent.futures.Future:
@@ -222,12 +199,6 @@ class MediaPipeWorker:
 
     def detect(self, image_bytes: bytes, config: dict[str, Any]) -> concurrent.futures.Future:
         return self.submit(lambda: self._detect(image_bytes, config))
-
-    def get_live_job(self, job_id: str) -> concurrent.futures.Future:
-        return self.submit(lambda: self._get_live_job(job_id))
-
-    def reset_stream(self, stream_id: str | None = None) -> concurrent.futures.Future:
-        return self.submit(lambda: self._reset_stream(stream_id))
 
     def close(self) -> None:
         if self._closed:
@@ -256,14 +227,6 @@ class MediaPipeWorker:
                 LOG.exception("failed to close MediaPipe detector")
         self._detectors.clear()
 
-    @staticmethod
-    def _running_mode_enum(mode: str) -> Any:
-        return {
-            "IMAGE": mp.tasks.vision.RunningMode.IMAGE,
-            "VIDEO": mp.tasks.vision.RunningMode.VIDEO,
-            "LIVE_STREAM": mp.tasks.vision.RunningMode.LIVE_STREAM,
-        }[mode]
-
     def _create_detector(self, key: DetectorKey) -> Any:
         base_kwargs: dict[str, Any] = {"model_asset_path": self.model_path}
         if key.delegate is not None:
@@ -276,20 +239,15 @@ class MediaPipeWorker:
             else None
         )
 
-        options_kwargs: dict[str, Any] = {
-            "base_options": mp.tasks.BaseOptions(**base_kwargs),
-            "running_mode": self._running_mode_enum(key.running_mode),
-            "display_names_locale": display_names_locale,
-            "max_results": key.max_results,
-            "score_threshold": key.score_threshold,
-            "category_allowlist": list(key.category_allowlist) or None,
-            "category_denylist": list(key.category_denylist) or None,
-        }
-
-        if key.running_mode == "LIVE_STREAM":
-            options_kwargs["result_callback"] = self._make_live_callback(key)
-
-        options = mp.tasks.vision.ObjectDetectorOptions(**options_kwargs)
+        options = mp.tasks.vision.ObjectDetectorOptions(
+            base_options=mp.tasks.BaseOptions(**base_kwargs),
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            display_names_locale=display_names_locale,
+            max_results=key.max_results,
+            score_threshold=key.score_threshold,
+            category_allowlist=list(key.category_allowlist) or None,
+            category_denylist=list(key.category_denylist) or None,
+        )
         return mp.tasks.vision.ObjectDetector.create_from_options(options)
 
     def _get_detector(self, key: DetectorKey) -> Any:
@@ -299,88 +257,14 @@ class MediaPipeWorker:
             self._detectors[key] = detector
         return detector
 
-    def _make_live_callback(self, key: DetectorKey) -> Callable[[Any, Any, int], None]:
-        def callback(result: Any, output_image: Any, timestamp_ms: int) -> None:
-            del output_image
-            payload = _serialize_result(result)
-            with self._live_lock:
-                pending_key = (key, int(timestamp_ms))
-                future = self._live_pending.pop(pending_key, None)
-                job_id = self._live_job_by_key_ts.pop(pending_key, None)
-                if job_id:
-                    self._live_jobs[job_id] = {
-                        "ok": True,
-                        "status": "done",
-                        "running_mode": "LIVE_STREAM",
-                        "stream_id": key.stream_id,
-                        "timestamp_ms": int(timestamp_ms),
-                        "result": payload,
-                    }
-            if future is not None and not future.done():
-                future.set_result(payload)
-        return callback
-
     def _detect(self, image_bytes: bytes, config: dict[str, Any]) -> dict[str, Any]:
         key = _coerce_detector_key(config)
-        timestamp_ms = _coerce_timestamp_ms(config, key.running_mode)
         image_processing_options = _make_image_processing_options(config)
         mp_image, image_meta = _decode_image(image_bytes)
         detector = self._get_detector(key)
 
-        if key.running_mode == "IMAGE":
-            result = detector.detect(mp_image, image_processing_options=image_processing_options)
-            return {"ok": True, "running_mode": key.running_mode, "stream_id": key.stream_id, "image": image_meta, "result": _serialize_result(result)}
-
-        if key.running_mode == "VIDEO":
-            assert timestamp_ms is not None
-            result = detector.detect_for_video(mp_image, timestamp_ms, image_processing_options=image_processing_options)
-            return {"ok": True, "running_mode": key.running_mode, "stream_id": key.stream_id, "timestamp_ms": timestamp_ms, "image": image_meta, "result": _serialize_result(result)}
-
-        assert key.running_mode == "LIVE_STREAM"
-        assert timestamp_ms is not None
-        wait_for_result = bool(config.get("wait_for_result", True))
-        timeout_s = float(config.get("live_stream_timeout_s", 2.0))
-        job_id = uuid.uuid4().hex
-        live_future: concurrent.futures.Future = concurrent.futures.Future()
-        pending_key = (key, timestamp_ms)
-
-        with self._live_lock:
-            self._live_pending[pending_key] = live_future
-            self._live_job_by_key_ts[pending_key] = job_id
-            self._live_jobs[job_id] = {
-                "ok": True,
-                "status": "pending",
-                "running_mode": "LIVE_STREAM",
-                "stream_id": key.stream_id,
-                "timestamp_ms": timestamp_ms,
-                "result": None,
-            }
-
-        detector.detect_async(mp_image, timestamp_ms, image_processing_options=image_processing_options)
-
-        if not wait_for_result:
-            return {"ok": True, "status": "accepted", "running_mode": key.running_mode, "stream_id": key.stream_id, "timestamp_ms": timestamp_ms, "image": image_meta, "job_id": job_id, "result_url": f"/v1/live-jobs/{job_id}"}
-
-        try:
-            result_payload = live_future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            return {"ok": True, "status": "pending_or_dropped", "running_mode": key.running_mode, "stream_id": key.stream_id, "timestamp_ms": timestamp_ms, "image": image_meta, "job_id": job_id, "result_url": f"/v1/live-jobs/{job_id}", "result": None, "warning": "No live-stream callback arrived before live_stream_timeout_s. MediaPipe can drop live-stream frames when busy."}
-
-        return {"ok": True, "status": "done", "running_mode": key.running_mode, "stream_id": key.stream_id, "timestamp_ms": timestamp_ms, "image": image_meta, "job_id": job_id, "result": result_payload}
-
-    def _get_live_job(self, job_id: str) -> dict[str, Any]:
-        with self._live_lock:
-            job = self._live_jobs.get(job_id)
-            if job is None:
-                raise ApiError(404, "live job not found")
-            return dict(job)
-
-    def _reset_stream(self, stream_id: str | None) -> dict[str, Any]:
-        keys = [key for key in self._detectors if stream_id is None or key.stream_id == stream_id]
-        for key in keys:
-            detector = self._detectors.pop(key)
-            detector.close()
-        return {"ok": True, "closed_detectors": len(keys), "stream_id": stream_id}
+        result = detector.detect(mp_image, image_processing_options=image_processing_options)
+        return {"ok": True, "image": image_meta, "result": _serialize_result(result)}
 
 
 async def _parse_multipart_request(request: web.Request) -> tuple[bytes, dict[str, Any]]:
@@ -433,22 +317,6 @@ async def detect_handler(request: web.Request) -> web.Response:
         return _json_error(500, "internal detection error")
 
 
-async def live_job_handler(request: web.Request) -> web.Response:
-    try:
-        future = request.app["worker"].get_live_job(request.match_info["job_id"])
-        return web.json_response(await asyncio.wrap_future(future))
-    except ApiError as exc:
-        return _json_error(exc.status, exc.message)
-
-
-async def reset_stream_handler(request: web.Request) -> web.Response:
-    try:
-        stream_id = request.match_info.get("stream_id")
-        future = request.app["worker"].reset_stream(stream_id)
-        return web.json_response(await asyncio.wrap_future(future))
-    except ApiError as exc:
-        return _json_error(exc.status, exc.message)
-
 
 async def health_handler(request: web.Request) -> web.Response:
     del request
@@ -470,8 +338,6 @@ def create_app(model_path: str, debug_errors: bool = False) -> web.Application:
     app.router.add_get("/health", health_handler)
     app.router.add_get("/healthz", health_handler)
     app.router.add_post("/v1/detect", detect_handler)
-    app.router.add_get("/v1/live-jobs/{job_id}", live_job_handler)
-    app.router.add_delete("/v1/streams/{stream_id}", reset_stream_handler)
     app.on_cleanup.append(on_cleanup)
     return app
 

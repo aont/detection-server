@@ -77,7 +77,7 @@ Multipart fields:
 
 ```bash
 curl -s \
-  -F 'config={"running_mode":"IMAGE","object_detector_options":{"score_threshold":0.25,"max_results":5}};type=application/json' \
+  -F 'config={"object_detector_options":{"score_threshold":0.25,"max_results":5}};type=application/json' \
   -F 'image=@sample.jpg;type=image/jpeg' \
   http://127.0.0.1:8080/v1/detect
 ```
@@ -85,7 +85,7 @@ curl -s \
 ### Python client example
 
 ```bash
-python client.py --mode IMAGE --score-threshold 0.25 --max-results 5 ./sample.jpg
+python client.py --score-threshold 0.25 --max-results 5 ./sample.jpg
 ```
 
 ## Configuration
@@ -94,11 +94,6 @@ Example `config` JSON:
 
 ```json
 {
-  "running_mode": "IMAGE",
-  "stream_id": "camera-1",
-  "timestamp_ms": 0,
-  "wait_for_result": true,
-  "live_stream_timeout_s": 2.0,
   "object_detector_options": {
     "delegate": "CPU",
     "display_names_locale": "en",
@@ -119,18 +114,6 @@ Example `config` JSON:
 }
 ```
 
-### Supported running modes
-
-| Mode | Description |
-|---|---|
-| `IMAGE` | Single-image detection |
-| `VIDEO` | Video-frame detection with monotonically increasing `timestamp_ms` |
-| `LIVE_STREAM` | Async live-stream detection using MediaPipe callback |
-
-For `VIDEO`, `timestamp_ms` is required and must increase for each `stream_id`.
-
-For `LIVE_STREAM`, `timestamp_ms` is recommended. If omitted, the server uses a monotonic timestamp.
-
 ## Response format
 
 Example response:
@@ -138,8 +121,6 @@ Example response:
 ```json
 {
   "ok": true,
-  "running_mode": "IMAGE",
-  "stream_id": "image",
   "image": {
     "width": 1280,
     "height": 720
@@ -169,46 +150,9 @@ Example response:
 }
 ```
 
-## LIVE_STREAM mode
-
-Send and wait for the callback result:
-
-```bash
-python client.py --mode LIVE_STREAM --stream-id camera-1 --timestamp-ms 1000 ./frame.jpg
-```
-
-To submit without waiting, send:
-
-```json
-{
-  "running_mode": "LIVE_STREAM",
-  "stream_id": "camera-1",
-  "timestamp_ms": 1000,
-  "wait_for_result": false,
-  "object_detector_options": {
-    "score_threshold": 0.25,
-    "max_results": 5
-  }
-}
-```
-
-Then poll:
-
-```bash
-curl http://127.0.0.1:8080/v1/live-jobs/<job_id>
-```
-
-## Reset a stream
-
-Use this when a camera or video stream restarts and timestamps should reset.
-
-```bash
-curl -X DELETE http://127.0.0.1:8080/v1/streams/camera-1
-```
-
 ## Notes
 
 - Do not send both `category_allowlist` and `category_denylist`.
 - `display_names_locale` is accepted as a JSON string; the server converts it to bytes internally for the current MediaPipe ctypes binding.
-- The server caches detector instances by running mode, stream ID, and detector options.
+- The server caches detector instances by detector options.
 - MediaPipe inference runs in a separate worker thread. HTTP request parsing and response handling remain asynchronous.

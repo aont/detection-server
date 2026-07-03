@@ -33,17 +33,12 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image", type=Path)
     parser.add_argument("--url", default="http://127.0.0.1:8080/v1/detect")
-    parser.add_argument("--mode", choices=["IMAGE", "VIDEO", "LIVE_STREAM"], default="IMAGE")
-    parser.add_argument("--stream-id", default="default")
-    parser.add_argument("--timestamp-ms", type=int)
     parser.add_argument("--score-threshold", type=float, default=0.25)
     parser.add_argument("--max-results", type=int, default=5)
     parser.add_argument("--display-names-locale", default=None)
     parser.add_argument("--allow", nargs="*", default=None)
     parser.add_argument("--deny", nargs="*", default=None)
     parser.add_argument("--rotation-degrees", type=int, default=0)
-    parser.add_argument("--wait-for-result", action="store_true", default=True)
-    parser.add_argument("--no-wait-for-result", action="store_false", dest="wait_for_result")
     args = parser.parse_args()
 
     detector_options: dict[str, Any] = {
@@ -58,16 +53,9 @@ async def main() -> None:
         detector_options["category_denylist"] = args.deny
 
     config: dict[str, Any] = {
-        "running_mode": args.mode,
         "object_detector_options": detector_options,
         "image_processing_options": {"rotation_degrees": args.rotation_degrees},
     }
-
-    if args.mode in {"VIDEO", "LIVE_STREAM"}:
-        config["stream_id"] = args.stream_id
-        config["timestamp_ms"] = args.timestamp_ms if args.timestamp_ms is not None else 0
-    if args.mode == "LIVE_STREAM":
-        config["wait_for_result"] = args.wait_for_result
 
     result = await post_detection(args.url, args.image, config)
     print(json.dumps(result, indent=2, ensure_ascii=False))
