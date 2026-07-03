@@ -1,27 +1,21 @@
-# MediaPipe EfficientDet Lite0 HTTP API
+# TFLite EfficientDet Lite0 HTTP API
 
-This project exposes MediaPipe Tasks `ObjectDetector` with `efficientdet_lite0.tflite` through an `aiohttp` HTTP server.
+This project exposes a `tflite-runtime` based object detector for `efficientdet_lite0.tflite` through an `aiohttp` HTTP server.
 
-The client sends both image bytes and detector configuration as `multipart/form-data`. MediaPipe processing runs on a dedicated worker thread so the `aiohttp` event loop is not blocked by inference.
+The client sends both image bytes and detector configuration as `multipart/form-data`. TFLite inference runs on a dedicated worker thread so the `aiohttp` event loop is not blocked by inference.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `server.py` | `aiohttp` server wrapping MediaPipe ObjectDetector |
+| `server.py` | `aiohttp` server wrapping a tflite-runtime Interpreter |
 | `client.py` | Multipart client example |
 | `requirements.txt` | Python dependencies |
 | `efficientdet_lite0.tflite` | Model file, supplied separately |
 
 ## Requirements
 
-Recommended Python version:
-
-```bash
-python 3.10 - 3.12
-```
-
-MediaPipe may not be reliable on unsupported newer Python versions. If you hit binding errors, recreate the virtual environment with Python 3.12.
+Recommended Python version depends on the `tflite-runtime` wheels available for your platform.
 
 Install dependencies:
 
@@ -96,7 +90,6 @@ Example `config` JSON:
 {
   "object_detector_options": {
     "delegate": "CPU",
-    "display_names_locale": "en",
     "max_results": 5,
     "score_threshold": 0.25,
     "category_allowlist": ["person", "dog"],
@@ -153,6 +146,8 @@ Example response:
 ## Notes
 
 - Do not send both `category_allowlist` and `category_denylist`.
-- `display_names_locale` is accepted as a JSON string; the server converts it to bytes internally for the current MediaPipe ctypes binding.
-- The server caches detector instances by detector options.
-- MediaPipe inference runs in a separate worker thread. HTTP request parsing and response handling remain asynchronous.
+- `delegate` accepts `CPU`; `GPU` is rejected because it is not provided by the base `tflite-runtime` interpreter.
+- `display_names_locale` is rejected because `tflite-runtime` does not expose MediaPipe Tasks label localization.
+- Without MediaPipe metadata helpers, categories are returned using the numeric class id as `category_name` and `display_name` is `null`.
+- The server caches TFLite interpreter instances by detector options.
+- TFLite inference runs in a separate worker thread. HTTP request parsing and response handling remain asynchronous.

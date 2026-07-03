@@ -1,4 +1,4 @@
 aiohttp
-mediapipe
+tflite-runtime
 pillow
 numpy

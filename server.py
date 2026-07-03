@@ -14,13 +14,12 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
-import mediapipe as mp
 import numpy as np
 from aiohttp import web
 from PIL import Image, ImageOps, UnidentifiedImageError
-from mediapipe.tasks.python.components.containers import rect as rect_module
+from tflite_runtime.interpreter import Interpreter
 
-LOG = logging.getLogger("mediapipe-api")
+LOG = logging.getLogger("tflite-api")
 
 
 class ApiError(Exception):
@@ -100,10 +99,10 @@ def _coerce_detector_key(config: dict[str, Any]) -> DetectorKey:
     )
 
 
-def _make_image_processing_options(config: dict[str, Any]) -> Any | None:
+def _get_image_transform(config: dict[str, Any]) -> tuple[int, tuple[float, float, float, float] | None]:
     img_opts = config.get("image_processing_options") or {}
     if not img_opts:
-        return None
+        return 0, None
 
     rotation_degrees = int(img_opts.get("rotation_degrees", 0))
     if rotation_degrees % 90 != 0:
@@ -125,13 +124,12 @@ def _make_image_processing_options(config: dict[str, Any]) -> Any | None:
             raise ApiError(400, "region_of_interest must satisfy left < right and top < bottom")
         if not all(0.0 <= value <= 1.0 for value in (left, top, right, bottom)):
             raise ApiError(400, "region_of_interest coordinates must be normalized values in [0, 1]")
+        roi = (left, top, right, bottom)
 
-        roi = rect_module.RectF(left=left, top=top, right=right, bottom=bottom)
-
-    return mp.tasks.vision.ImageProcessingOptions(region_of_interest=roi, rotation_degrees=rotation_degrees)
+    return rotation_degrees % 360, roi
 
 
-def _decode_image(image_bytes: bytes) -> tuple[Any, dict[str, int]]:
+def _decode_image(image_bytes: bytes) -> tuple[np.ndarray, dict[str, int]]:
     if not image_bytes:
         raise ApiError(400, "image part is empty")
 
@@ -142,57 +140,65 @@ def _decode_image(image_bytes: bytes) -> tuple[Any, dict[str, int]]:
     except UnidentifiedImageError as exc:
         raise ApiError(400, "image part is not a supported image file") from exc
 
-    return mp.Image(image_format=mp.ImageFormat.SRGB, data=array), {
+    return array, {
         "width": int(array.shape[1]),
         "height": int(array.shape[0]),
     }
 
 
-def _serialize_result(result: Any) -> dict[str, Any]:
-    detections: list[dict[str, Any]] = []
-    for detection in result.detections:
-        box = detection.bounding_box
-        detections.append({
-            "bounding_box": {
-                "origin_x": box.origin_x,
-                "origin_y": box.origin_y,
-                "width": box.width,
-                "height": box.height,
-            },
-            "categories": [
-                {
-                    "index": category.index,
-                    "score": category.score,
-                    "display_name": category.display_name,
-                    "category_name": category.category_name,
-                }
-                for category in detection.categories
-            ],
-            "keypoints": [
-                {
-                    "x": keypoint.x,
-                    "y": keypoint.y,
-                    "label": keypoint.label,
-                    "score": keypoint.score,
-                }
-                for keypoint in detection.keypoints
-            ] if detection.keypoints else None,
-        })
-    return {"detections": detections, "detection_count": len(detections)}
+def _resize_for_input(image: np.ndarray, input_detail: dict[str, Any]) -> np.ndarray:
+    _, height, width, channels = input_detail["shape"]
+    if channels != 3:
+        raise ApiError(500, "model input must have 3 color channels")
+
+    resized = Image.fromarray(image).resize((int(width), int(height)), Image.Resampling.BILINEAR)
+    input_data = np.asarray(resized)
+
+    if input_detail["dtype"] == np.float32:
+        quant = input_detail.get("quantization", (0.0, 0))
+        scale, zero_point = quant
+        input_data = input_data.astype(np.float32)
+        if scale and scale > 0:
+            input_data = (input_data - float(zero_point)) * float(scale)
+        else:
+            input_data = (input_data - 127.5) / 127.5
+    else:
+        input_data = input_data.astype(input_detail["dtype"])
+
+    return np.expand_dims(input_data, axis=0)
 
 
-class MediaPipeWorker:
+def _apply_image_transform(
+    image: np.ndarray,
+    rotation_degrees: int,
+    roi: tuple[float, float, float, float] | None,
+) -> np.ndarray:
+    if rotation_degrees:
+        image = np.rot90(image, k=(-rotation_degrees // 90) % 4)
+    if roi is None:
+        return image
+
+    height, width = image.shape[:2]
+    left, top, right, bottom = roi
+    x1 = int(round(left * width))
+    y1 = int(round(top * height))
+    x2 = int(round(right * width))
+    y2 = int(round(bottom * height))
+    return np.ascontiguousarray(image[y1:y2, x1:x2])
+
+
+class TFLiteWorker:
     def __init__(self, model_path: str):
         self.model_path = model_path
         self._jobs: queue.Queue[tuple[Callable[[], Any] | None, concurrent.futures.Future | None]] = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name="mediapipe-worker", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="tflite-worker", daemon=True)
         self._closed = False
         self._detectors: dict[DetectorKey, Any] = {}
         self._thread.start()
 
     def submit(self, func: Callable[[], Any]) -> concurrent.futures.Future:
         if self._closed:
-            raise ApiError(503, "MediaPipe worker is closed")
+            raise ApiError(503, "TFLite worker is closed")
         future: concurrent.futures.Future = concurrent.futures.Future()
         self._jobs.put((func, future))
         return future
@@ -220,35 +226,17 @@ class MediaPipeWorker:
             except BaseException as exc:
                 future.set_exception(exc)
 
-        for detector in self._detectors.values():
-            try:
-                detector.close()
-            except Exception:
-                LOG.exception("failed to close MediaPipe detector")
         self._detectors.clear()
 
     def _create_detector(self, key: DetectorKey) -> Any:
-        base_kwargs: dict[str, Any] = {"model_asset_path": self.model_path}
-        if key.delegate is not None:
-            base_kwargs["delegate"] = getattr(mp.tasks.BaseOptions.Delegate, key.delegate)
+        if key.delegate == "GPU":
+            raise ApiError(400, "object_detector_options.delegate=GPU is not supported by tflite-runtime")
+        if key.display_names_locale is not None:
+            raise ApiError(400, "object_detector_options.display_names_locale is not supported by tflite-runtime")
 
-        # Work around MediaPipe ctypes binding issue: c_char_p needs bytes, not str.
-        display_names_locale = (
-            key.display_names_locale.encode("utf-8")
-            if key.display_names_locale is not None
-            else None
-        )
-
-        options = mp.tasks.vision.ObjectDetectorOptions(
-            base_options=mp.tasks.BaseOptions(**base_kwargs),
-            running_mode=mp.tasks.vision.RunningMode.IMAGE,
-            display_names_locale=display_names_locale,
-            max_results=key.max_results,
-            score_threshold=key.score_threshold,
-            category_allowlist=list(key.category_allowlist) or None,
-            category_denylist=list(key.category_denylist) or None,
-        )
-        return mp.tasks.vision.ObjectDetector.create_from_options(options)
+        interpreter = Interpreter(model_path=self.model_path)
+        interpreter.allocate_tensors()
+        return interpreter
 
     def _get_detector(self, key: DetectorKey) -> Any:
         detector = self._detectors.get(key)
@@ -259,12 +247,75 @@ class MediaPipeWorker:
 
     def _detect(self, image_bytes: bytes, config: dict[str, Any]) -> dict[str, Any]:
         key = _coerce_detector_key(config)
-        image_processing_options = _make_image_processing_options(config)
-        mp_image, image_meta = _decode_image(image_bytes)
-        detector = self._get_detector(key)
+        rotation_degrees, roi = _get_image_transform(config)
+        image, image_meta = _decode_image(image_bytes)
+        image = _apply_image_transform(image, rotation_degrees, roi)
+        interpreter = self._get_detector(key)
 
-        result = detector.detect(mp_image, image_processing_options=image_processing_options)
-        return {"ok": True, "image": image_meta, "result": _serialize_result(result)}
+        input_detail = interpreter.get_input_details()[0]
+        interpreter.set_tensor(input_detail["index"], _resize_for_input(image, input_detail))
+        interpreter.invoke()
+
+        output_details = interpreter.get_output_details()
+        outputs = [interpreter.get_tensor(detail["index"]) for detail in output_details]
+        detections = _serialize_tflite_outputs(outputs, image.shape[1], image.shape[0], key)
+        return {
+            "ok": True,
+            "image": image_meta,
+            "result": {"detections": detections, "detection_count": len(detections)},
+        }
+
+
+def _serialize_tflite_outputs(
+    outputs: list[np.ndarray],
+    image_width: int,
+    image_height: int,
+    key: DetectorKey,
+) -> list[dict[str, Any]]:
+    if len(outputs) < 4:
+        raise ApiError(500, "model must expose TFLite Detection PostProcess outputs")
+
+    boxes = np.squeeze(outputs[0])
+    classes = np.squeeze(outputs[1])
+    scores = np.squeeze(outputs[2])
+    count = int(np.squeeze(outputs[3]))
+
+    max_results = count if key.max_results == -1 else min(count, key.max_results)
+    detections: list[dict[str, Any]] = []
+    for i in range(max_results):
+        score = float(scores[i])
+        if score < key.score_threshold:
+            continue
+
+        class_index = int(classes[i])
+        category_name = str(class_index)
+        if key.category_allowlist and category_name not in key.category_allowlist:
+            continue
+        if key.category_denylist and category_name in key.category_denylist:
+            continue
+
+        ymin, xmin, ymax, xmax = [float(value) for value in boxes[i]]
+        origin_x = max(0, int(round(xmin * image_width)))
+        origin_y = max(0, int(round(ymin * image_height)))
+        width = max(0, int(round((xmax - xmin) * image_width)))
+        height = max(0, int(round((ymax - ymin) * image_height)))
+
+        detections.append({
+            "bounding_box": {
+                "origin_x": origin_x,
+                "origin_y": origin_y,
+                "width": width,
+                "height": height,
+            },
+            "categories": [{
+                "index": class_index,
+                "score": score,
+                "display_name": None,
+                "category_name": category_name,
+            }],
+            "keypoints": None,
+        })
+    return detections
 
 
 async def _parse_multipart_request(request: web.Request) -> tuple[bytes, dict[str, Any]]:
@@ -332,7 +383,7 @@ def create_app(model_path: str, debug_errors: bool = False) -> web.Application:
         raise FileNotFoundError(f"model file not found: {model_path}")
 
     app = web.Application(client_max_size=64 * 1024 * 1024)
-    app["worker"] = MediaPipeWorker(model_path)
+    app["worker"] = TFLiteWorker(model_path)
     app["debug_errors"] = debug_errors
 
     app.router.add_get("/health", health_handler)
