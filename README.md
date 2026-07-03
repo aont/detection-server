@@ -32,14 +32,30 @@ python -m pip install -r requirements.txt
 
 ## Start the server
 
+Listen on a TCP host and port:
+
 ```bash
 python server.py --model ./efficientdet_lite0.tflite --host 0.0.0.0 --port 8080
 ```
+
+Or listen on a Unix domain socket:
+
+```bash
+python server.py --model ./efficientdet_lite0.tflite --unix-socket /tmp/detection-server.sock
+```
+
+When `--unix-socket` (or the `UNIX_SOCKET` environment variable) is set, the server ignores `--host` and `--port`. If an existing socket file is present at that path, it is removed before binding; non-socket files are left untouched and cause startup to fail.
 
 Health check:
 
 ```bash
 curl http://127.0.0.1:8080/health
+```
+
+For a Unix socket:
+
+```bash
+curl --unix-socket /tmp/detection-server.sock http://localhost/health
 ```
 
 or:

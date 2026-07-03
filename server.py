@@ -342,16 +342,35 @@ def create_app(model_path: str, debug_errors: bool = False) -> web.Application:
     return app
 
 
+def _prepare_unix_socket(path: str) -> None:
+    socket_path = Path(path).expanduser()
+    if socket_path.exists():
+        if not socket_path.is_socket():
+            raise FileExistsError(f"unix socket path exists and is not a socket: {socket_path}")
+        socket_path.unlink()
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=os.environ.get("MODEL_PATH", "efficientdet_lite0.tflite"))
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    parser.add_argument(
+        "--unix-socket",
+        default=os.environ.get("UNIX_SOCKET"),
+        help="Serve HTTP over this Unix domain socket path instead of host/port",
+    )
     parser.add_argument("--debug-errors", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
-    web.run_app(create_app(args.model, args.debug_errors), host=args.host, port=args.port)
+    app = create_app(args.model, args.debug_errors)
+    if args.unix_socket:
+        _prepare_unix_socket(args.unix_socket)
+        web.run_app(app, path=str(Path(args.unix_socket).expanduser()))
+    else:
+        web.run_app(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
