@@ -1,0 +1,4 @@
+aiohttp
+mediapipe
+pillow
+numpy
